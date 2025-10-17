@@ -10,15 +10,18 @@ from collections import defaultdict, Counter
 from ultralytics import YOLO
 from tqdm import tqdm
 import torch
-import numpy as np
-from torchvision.models import ViT_B_16_Weights, vit_b_16
+import torch.nn as nn
+from torchvision import models, transforms
 from PIL import Image
 
 # ==============================================================================
 # PHẦN CẤU HÌNH VÀ KHỞI TẠO MODEL
 # ==============================================================================
 
-# 1. Định nghĩa ánh xạ từ ImageNet sang các lớp tùy chỉnh
+# ------------------------------------------------------------------------------
+# 1. CẤU HÌNH MODEL ViT CHUNG (PRE-TRAINED TRÊN IMAGENET)
+# ------------------------------------------------------------------------------
+# Định nghĩa ánh xạ từ ImageNet sang các lớp tùy chỉnh
 CUSTOM_CLASSES = {
     'car': [
         'sports car, sport car', 'convertible', 'jeep, landrover', 'limousine, limo',
@@ -35,21 +38,73 @@ CUSTOM_CLASSES = {
 # Tạo map tra cứu ngược
 imagenet_to_custom_map = {label: custom_class for custom_class, labels in CUSTOM_CLASSES.items() for label in labels}
 
-# 2. Tải mô hình ViT (chỉ một lần)
-print("Đang tải mô hình Vision Transformer (ViT)...")
-vit_weights = ViT_B_16_Weights.IMAGENET1K_V1
-vit_model = vit_b_16(weights=vit_weights)
+# Tải mô hình ViT ImageNet (chỉ một lần)
+print("Đang tải mô hình Vision Transformer (ViT) từ ImageNet...")
+vit_weights = models.ViT_B_16_Weights.IMAGENET1K_V1
+vit_model = models.vit_b_16(weights=vit_weights)
 vit_model.eval()
 vit_preprocess = vit_weights.transforms()
 imagenet_categories = vit_weights.meta["categories"]
-print("Mô hình ViT đã được tải.")
+print("Mô hình ViT ImageNet đã được tải.")
+
+# ------------------------------------------------------------------------------
+# 2. CẤU HÌNH MODEL ViT TÙY CHỈNH (MODEL BẠN ĐÃ HUẤN LUYỆN)
+# ------------------------------------------------------------------------------
+CUSTOM_VIT_WEIGHTS_PATH = "bike_motorbike_vit_weights.pth"
+# Các lớp mà model tùy chỉnh của bạn đã được huấn luyện, THEO ĐÚNG THỨ TỰ.
+# Dựa trên script huấn luyện của bạn, thứ tự là ['bike', 'motorbike']
+CUSTOM_VIT_CLASSES = ['bike', 'motorbike']
+# Ánh xạ từ output của model tùy chỉnh sang nhãn chuẩn hóa
+CUSTOM_VIT_LABEL_MAP = {
+    'bike': 'bicycle',
+    'motorbike': 'motorcycle'
+}
 
 
-# 3. Hàm phân loại bằng ViT
-def classify_with_vit(image_crop_np, device='cpu'):
+def load_custom_vit_model(weights_path, num_classes):
+    """Hàm để tải kiến trúc ViT và áp trọng số đã huấn luyện của bạn."""
+    if not os.path.exists(weights_path):
+        print(f"LỖI: Không tìm thấy tệp trọng số '{weights_path}'. Vui lòng đảm bảo tệp này tồn tại.")
+        return None, None
+
+    print(f"Đang tải mô hình ViT tùy chỉnh từ '{weights_path}'...")
+    model = models.vit_b_16(weights=None)  # Khởi tạo không có trọng số pre-trained
+
+    # Thay thế lớp phân loại cuối cùng để khớp với số lớp của bạn (là 2)
+    num_ftrs = model.heads.head.in_features
+    model.heads.head = nn.Linear(num_ftrs, num_classes)
+
+    # Tải trọng số đã huấn luyện
+    # Dùng map_location để đảm bảo model tải được trên cả CPU và GPU
+    model.load_state_dict(torch.load(weights_path, map_location=torch.device('cuda:0')))
+    model.eval()
+
+    # Tạo bộ tiền xử lý ảnh (phải giống với bộ validation trong lúc train)
+    preprocess = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
+
+    print("Mô hình ViT tùy chỉnh đã được tải thành công.")
+    return model, preprocess
+
+
+# Tải model ViT tùy chỉnh
+custom_vit_model, custom_vit_preprocess = load_custom_vit_model(
+    CUSTOM_VIT_WEIGHTS_PATH,
+    len(CUSTOM_VIT_CLASSES)
+)
+
+
+# ------------------------------------------------------------------------------
+# 3. CÁC HÀM PHÂN LOẠI
+# ------------------------------------------------------------------------------
+def classify_with_vit(image_crop_np, device='cuda:0'):
+    """Phân loại ảnh bằng model ViT pre-trained trên ImageNet."""
     try:
-        img_rgb = cv2.cvtColor(image_crop_np, cv2.COLOR_BGR2RGB)
-        img_pil = Image.fromarray(img_rgb)
+        img_pil = Image.fromarray(cv2.cvtColor(image_crop_np, cv2.COLOR_BGR2RGB))
         img_tensor = vit_preprocess(img_pil).unsqueeze(0).to(device)
         with torch.no_grad():
             output = vit_model(img_tensor)
@@ -60,13 +115,27 @@ def classify_with_vit(image_crop_np, device='cpu'):
         return "other"
 
 
+def classify_bike_motorbike_with_custom_vit(image_crop_np, device='cuda:0'):
+    """Phân loại ảnh bằng model ViT tùy chỉnh để phân biệt bike/motorbike."""
+    try:
+        img_pil = Image.fromarray(cv2.cvtColor(image_crop_np, cv2.COLOR_BGR2RGB))
+        img_tensor = custom_vit_preprocess(img_pil).unsqueeze(0).to(device)
+        with torch.no_grad():
+            output = custom_vit_model(img_tensor)
+        prediction_index = output.argmax(dim=1)[0]
+        predicted_label = CUSTOM_VIT_CLASSES[prediction_index]
+        # Sử dụng map để trả về nhãn nhất quán ('bicycle' hoặc 'motorcycle')
+        return CUSTOM_VIT_LABEL_MAP.get(predicted_label, 'other')
+    except Exception:
+        return "other"
+
+
 # ==============================================================================
-# PHẦN CẤU HÌNH
+# PHẦN CẤU HÌNH XỬ LÝ VIDEO
 # ==============================================================================
 INPUT_VIDEO_DIR = "input_videos"
 OUTPUT_VIDEO_DIR = "output_videos"
 OUTPUT_FRAMES_DIR = "output_frames"
-# OUTPUT_DIFFERENCES_DIR đã bị loại bỏ vì không còn phù hợp
 OUTPUT_JSON_FILE = "results.json"
 MODEL_NAME = 'yolo12x.pt'
 
@@ -81,23 +150,24 @@ for dir_path in [OUTPUT_FRAMES_DIR, OUTPUT_VIDEO_DIR]:
 # ==============================================================================
 # PHẦN XỬ LÝ CHÍNH
 # ==============================================================================
-
 def analyze_videos_single_device():
     start_time = time.time()
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Sử dụng thiết bị: {device}")
+
+    # Chuyển các model đến đúng thiết bị
     vit_model.to(device)
+    if custom_vit_model:
+        custom_vit_model.to(device)
+    else:
+        print("CẢNH BÁO: Không thể tải model ViT tùy chỉnh. Chức năng phân loại bike/motorbike sẽ không hoạt động.")
+        return  # Dừng nếu không tải được model tùy chỉnh
 
     # 1. Tải mô hình YOLO
     print(f"Đang tải mô hình {MODEL_NAME}...")
     yolo_model = YOLO(MODEL_NAME)
     CLASS_NAMES = yolo_model.names
     print("Mô hình YOLO đã được tải thành công.")
-
-    # Thêm các nhãn gốc của YOLO vào map để xử lý nhất quán
-    for key in CLASS_NAMES.values():
-        if key in CUSTOM_CLASSES:
-            imagenet_to_custom_map[key] = key
 
     os.makedirs(OUTPUT_VIDEO_DIR, exist_ok=True)
     os.makedirs(OUTPUT_FRAMES_DIR, exist_ok=True)
@@ -117,8 +187,6 @@ def analyze_videos_single_device():
 
         cap = cv2.VideoCapture(video_path)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-        # --- CẤU TRÚC LƯU TRỮ DỮ LIỆU ---
         tracked_object_classifications = defaultdict(list)
         frame_by_frame_results = []
 
@@ -137,15 +205,30 @@ def analyze_videos_single_device():
                 for box in yolo_results.boxes:
                     tracker_id = int(box.id[0])
                     x1, y1, x2, y2 = map(int, box.xyxy[0])
-                    yolo_label = CLASS_NAMES[int(box.cls[0])]
+                    yolo_label_id = int(box.cls[0])
+                    yolo_label = CLASS_NAMES.get(yolo_label_id, "unknown")
 
+                    # =========================================================
+                    # ========= LOGIC PHÂN LOẠI ĐÃ ĐƯỢC CẬP NHẬT =========
+                    # =========================================================
                     final_label = "other"
-                    if yolo_label == 'person':
+
+                    # Ưu tiên 1: Nếu YOLO nhận diện là motor/bike, dùng model ViT tùy chỉnh để quyết định
+                    if yolo_label in ['motorcycle', 'bicycle']:
+                        cropped_object = frame[y1:y2, x1:x2]
+                        if cropped_object.size > 0:
+                            final_label = classify_bike_motorbike_with_custom_vit(cropped_object, device)
+
+                    # Ưu tiên 2: Nếu là người thì giữ nguyên
+                    elif yolo_label == 'person':
                         final_label = 'person'
+
+                    # Mặc định: Dùng ViT ImageNet cho các lớp còn lại (ví dụ: car)
                     else:
                         cropped_object = frame[y1:y2, x1:x2]
                         if cropped_object.size > 0:
                             final_label = classify_with_vit(cropped_object, device)
+                    # =========================================================
 
                     if final_label != 'other':
                         tracked_object_classifications[tracker_id].append(final_label)
@@ -154,13 +237,12 @@ def analyze_videos_single_device():
             frame_by_frame_results.append(current_frame_objects)
 
         # ==============================================================================
-        # BƯỚC TRUNG GIAN: QUYẾT ĐỊNH NHÃN CUỐI CÙNG CHO MỖI ĐỐI TƯỢNG
+        # BƯỚC TRUNG GIAN: QUYẾT ĐỊNH NHÃN CUỐI CÙNG CHO MỖI ĐỐI TƯỢỢNG
         # ==============================================================================
         print("\nBước trung gian: Quyết định nhãn cuối cùng...")
         final_object_labels = {}
         for tracker_id, labels in tracked_object_classifications.items():
             if labels:
-                # Tìm nhãn xuất hiện nhiều nhất
                 most_common_label = Counter(labels).most_common(1)[0][0]
                 final_object_labels[tracker_id] = most_common_label
 
@@ -199,7 +281,6 @@ def analyze_videos_single_device():
                     cv2.putText(annotated_frame, label_text, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0),
                                 2)
 
-            # --- KIỂM TRA ĐIỀU KIỆN DỰA TRÊN KẾT QUẢ CUỐI CÙNG ---
             def process_match(question_id):
                 video_frame_indices[question_id].append(frame_idx)
                 if video_question_frames[question_id]["start"] is None:
@@ -221,7 +302,6 @@ def analyze_videos_single_device():
         cap.release()
         out_writer.release()
 
-        # Lưu các frame đầu/cuối và kết quả JSON
         for q_id, frames in video_question_frames.items():
             if frames["start"] is not None:
                 start_idx, start_img = frames["start"]
@@ -237,7 +317,6 @@ def analyze_videos_single_device():
 
         print(f"\nĐã xử lý xong video {video_name}. Video output được lưu tại: {output_video_path}")
 
-    # 5. Lưu kết quả cuối cùng
     with open(OUTPUT_JSON_FILE, 'w', encoding='utf-8') as f:
         json.dump(final_results, f, ensure_ascii=False, indent=4)
 

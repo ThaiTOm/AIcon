@@ -6,6 +6,7 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from PIL import Image, UnidentifiedImageError
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms, models
 from tqdm import tqdm
@@ -20,6 +21,63 @@ import random
 SOURCE_DATA_DIR = "datasets"
 # Thư mục đích để chứa bộ dữ liệu đã được chia train/val
 PREPARED_DATA_DIR = os.path.join(SOURCE_DATA_DIR, "prepared_data")
+
+
+def clean_image_dataset(root_dir):
+    """
+    Duyệt qua tất cả các tệp trong thư mục và các thư mục con,
+    xóa các tệp không thể mở và chuyển đổi sang RGB.
+    """
+    if not os.path.isdir(root_dir):
+        print(f"Lỗi: Thư mục '{root_dir}' không tồn tại.")
+        return
+
+    print(f"Bắt đầu quá trình quét và dọn dẹp thư mục: {root_dir}")
+
+    deleted_files_count = 0
+
+    # Tạo một danh sách các file để duyệt qua, giúp tqdm hoạt động tốt hơn
+    all_files = []
+    for subdir, dirs, files in os.walk(root_dir):
+        for filename in files:
+            all_files.append(os.path.join(subdir, filename))
+
+    print(f"Tìm thấy tổng cộng {len(all_files)} tệp để kiểm tra.")
+
+    for file_path in tqdm(all_files, desc="Đang kiểm tra ảnh"):
+        # Kiểm tra phần mở rộng tệp để chỉ xử lý các định dạng ảnh phổ biến
+        if not file_path.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.tiff')):
+            continue
+
+        try:
+            # Cố gắng mở ảnh
+            with Image.open(file_path) as img:
+                # ### <<< THAY ĐỔI QUAN TRỌNG ###
+                # Thay vì chỉ verify(), chúng ta thực hiện convert('RGB').
+                # Đây là bài kiểm tra mạnh hơn nhiều, nó buộc Pillow phải đọc
+                # toàn bộ dữ liệu ảnh, giống hệt như DataLoader làm.
+                img.convert('RGB')
+
+        except (IOError, OSError, UnidentifiedImageError) as e:
+            # Nếu có bất kỳ lỗi nào xảy ra khi mở hoặc chuyển đổi ảnh
+            print(f"\nPhát hiện tệp ảnh bị lỗi hoặc không thể xử lý: {file_path}")
+            print(f"Lỗi: {e}")
+
+            try:
+                # Cố gắng xóa tệp bị lỗi
+                os.remove(file_path)
+                print(f"Đã xóa thành công tệp: {file_path}")
+                deleted_files_count += 1
+            except OSError as remove_error:
+                print(f"Lỗi khi xóa tệp: {remove_error}")
+
+    print("\n==============================================")
+    print(f"QUÁ TRÌNH DỌN DẸP CHO '{root_dir}' HOÀN TẤT!")
+    if deleted_files_count > 0:
+        print(f"Tổng số tệp ảnh bị lỗi và đã được xóa: {deleted_files_count}")
+    else:
+        print("Không tìm thấy tệp ảnh nào bị lỗi trong thư mục này.")
+    print("==============================================")
 
 # Tên tệp để lưu trọng số đã huấn luyện
 WEIGHTS_SAVE_PATH = "bike_motorbike_vit_weights.pth"
@@ -83,6 +141,7 @@ def split_data_from_source(source_dir, prepared_dir, split_ratio):
         for f in tqdm(val_files, desc=f"Sao chép {cls} vào val"):
             shutil.copy(os.path.join(source_class_dir, f), os.path.join(prepared_dir, 'val', cls, f))
 
+
     print("Chia tách dữ liệu hoàn tất.")
 
 
@@ -103,6 +162,11 @@ def create_dataloaders(prepared_dataset_dir):
             transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
         ]),
     }
+    clean_image_dataset(os.path.join(prepared_dataset_dir, 'train', 'bike'))
+    clean_image_dataset(os.path.join(prepared_dataset_dir, 'train', 'motorbike'))
+    clean_image_dataset(os.path.join(prepared_dataset_dir, 'val', 'bike'))
+    clean_image_dataset(os.path.join(prepared_dataset_dir, 'val', 'motorbike'))
+
 
     image_datasets = {x: datasets.ImageFolder(os.path.join(prepared_dataset_dir, x), data_transforms[x])
                       for x in ['train', 'val']}
@@ -184,6 +248,9 @@ if __name__ == '__main__':
     # 4. Thay thế lớp phân loại cuối cùng
     num_ftrs = model.heads.head.in_features
     model.heads.head = nn.Linear(num_ftrs, len(class_names))
+
+    model.load_state_dict(torch.load("bike_motorbike_vit_weights.pth", map_location=torch.device('cuda:0')))
+
 
     model = model.to(DEVICE)
     print("Mô hình đã được sửa đổi cho 2 lớp.")

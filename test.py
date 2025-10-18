@@ -1,82 +1,140 @@
-from transformers import ConvNextFeatureExtractor, ConvNextForImageClassification
+# ==============================================================================
+# IMPORT LIBRARIES
+# ==============================================================================
 import torch
+import torch.nn as nn
+from torchvision import models, transforms
 from PIL import Image
-import cv2
+import os
+import sys
 
-# ------------------- STEP 1: DEFINE THE MAPPING -------------------
-# Create a dictionary to group the detailed ImageNet classes into the classes you want.
-# You can add or remove classes from this list if you wish.
-CUSTOM_CLASSES = {
-    'car': [
-        'sports car, sport car', 'convertible', 'jeep, landrover',
-        'limousine, limo', 'minivan', 'racer, race car, racing car',
-        'cab, hack, taxi, taxicab', 'ambulance',
-        'police van, police wagon, paddy wagon, patrol wagon, wagon, black Maria',
-        'recreational vehicle, RV, R.V.', 'station wagon, wagon, estate car, beach wagon, station waggon, waggon',
-        'passenger car, coach, carriage'
-    ],
-    'motorcycle': [
-        'motor scooter, scooter', 'moped', 'motorcycle'
-    ],
-    'bicycle': [
-        'mountain bike, all-terrain bike, off-roader', 'bicycle-built-for-two, tandem bicycle, tandem',
-        'unicycle, monocycle'
-    ],
-    'person': [
-        'scuba diver', 'groom, bridegroom', 'baseball player, ballplayer', 'skier'
-        # Warning: The 'person' class on ImageNet is very limited and not reliable.
-    ]
-}
+# ==============================================================================
+# CONFIGURATION
+# ==============================================================================
+# Path to the trained weights file saved from train_vit.py
+WEIGHTS_PATH = "bike_motorbike_vit_weights.pth"
 
-# Create a reverse mapping dictionary for faster lookup
-# Example: {'sports car, sport car': 'car', 'moped': 'motorcycle', ...}
-imagenet_to_custom_map = {}
-for custom_class, imagenet_labels in CUSTOM_CLASSES.items():
-    for label in imagenet_labels:
-        imagenet_to_custom_map[label] = custom_class
-# --------------------------------------------------------------------
+# Path to the image you want to classify
+# --->>> CHANGE THIS TO YOUR IMAGE FILE <<<---
+IMAGE_TO_TEST = "test.jpg"
 
-# 1. Load the model and feature extractor
-feature_extractor = ConvNextFeatureExtractor.from_pretrained("facebook/convnext-large-384-22k-1k")
-model = ConvNextForImageClassification.from_pretrained("facebook/convnext-large-384-22k-1k")
-model.eval()
+# The classes the model was trained on. MUST match the order from training.
+CLASS_NAMES = ['bike', 'motorbike']
 
-# 2. Preprocess the image
-img_path = "test.jpg"  # <-- Change your image file name here
-try:
-    img_cv = cv2.imread(img_path)
-    if img_cv is None:
-        raise FileNotFoundError(f"Cannot read image file: {img_path}")
+# Device (use GPU if available)
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"Using device: {DEVICE}")
 
-    img_rgb = cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB)
-    img_pil = Image.fromarray(img_rgb)
 
-    # The feature extractor will handle the necessary transformations
-    inputs = feature_extractor(img_pil, return_tensors="pt")
+# ==============================================================================
+# MODEL AND TRANSFORMS DEFINITION
+# ==============================================================================
 
-    # 3. Make a prediction
+def load_trained_model(weights_path, num_classes):
+    """
+    Loads the ViT model architecture and the trained weights.
+    """
+    # Load the ViT-B-16 model structure without pre-trained weights
+    model = models.vit_b_16(weights=None)
+
+    # Replace the final classification layer to match our number of classes (2)
+    num_ftrs = model.heads.head.in_features
+    model.heads.head = nn.Linear(num_ftrs, num_classes)
+
+    # Load the state dictionary from the saved weights file
+    # map_location ensures it works even if you trained on GPU and are testing on CPU
+    model.load_state_dict(torch.load(weights_path, map_location=DEVICE))
+
+    # Move the model to the selected device
+    model = model.to(DEVICE)
+
+    # Set the model to evaluation mode (important for inference)
+    model.eval()
+
+    print("Model loaded and set to evaluation mode.")
+    return model
+
+
+def get_image_transforms():
+    """
+    Returns the same image transformations used for the validation set during training.
+    This ensures the input for inference is processed identically.
+    """
+    return transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
+
+
+# ==============================================================================
+# PREDICTION FUNCTION
+# ==============================================================================
+
+def predict_image(model, image_path, transforms, class_names):
+    """
+    Takes a model and an image path, and returns the predicted class and confidence.
+    """
+    try:
+        # Open the image using PIL
+        img = Image.open(image_path).convert('RGB')
+    except FileNotFoundError:
+        print(f"Error: Image file not found at '{image_path}'")
+        return None, None
+
+    # Apply the transformations to the image
+    img_transformed = transforms(img)
+
+    # Add a batch dimension (models expect a batch of images)
+    # The result should be of shape [1, 3, 224, 224]
+    batch_img = img_transformed.unsqueeze(0)
+
+    # Move the input tensor to the device
+    batch_img = batch_img.to(DEVICE)
+
+    # Make a prediction without calculating gradients
     with torch.no_grad():
-        logits = model(**inputs).logits
+        outputs = model(batch_img)
+
+        # Apply Softmax to get probabilities
+        probabilities = torch.nn.functional.softmax(outputs, dim=1)
+
+        # Get the top prediction
+        confidence, predicted_index = torch.max(probabilities, 1)
+
+    # Get the class name using the predicted index
+    predicted_class = class_names[predicted_index.item()]
+
+    return predicted_class, confidence.item()
 
 
-    # 4. Get the original result from ImageNet
-    prediction_index = logits.argmax(-1).item()
-    predicted_imagenet_label = model.config.id2label[prediction_index]
+# ==============================================================================
+# MAIN EXECUTION
+# ==============================================================================
 
+if __name__ == '__main__':
+    # 1. Check if the weights file exists
+    if not os.path.exists(WEIGHTS_PATH):
+        print(f"Error: Weights file not found at '{WEIGHTS_PATH}'")
+        print("Please make sure you have run the training script and the file is in the correct location.")
+        sys.exit(1)
 
-    # ------ STEP 2: APPLY THE MAPPING TO GET THE FINAL RESULT ------
-    # Use the created map to find the custom class. If not found, return "Other".
-    final_prediction = imagenet_to_custom_map.get(
-        predicted_imagenet_label,
-        "Not one of the classes of interest (Other)"
-    )
-    # ----------------------------------------------------------------
+    # 2. Load the trained model
+    model = load_trained_model(WEIGHTS_PATH, len(CLASS_NAMES))
 
-    print(f"Original prediction from ConvNext (ImageNet): '{predicted_imagenet_label}'")
-    print("-" * 30)
-    print(f"==> Result after filtering: {final_prediction}")
+    # 3. Get the necessary image transformations
+    image_transforms = get_image_transforms()
 
+    # 4. Perform the prediction on the test image
+    predicted_class, confidence = predict_image(model, IMAGE_TO_TEST, image_transforms, CLASS_NAMES)
 
-except FileNotFoundError as e:
-    print(e)
-    print("Please check the path and file name 'test.jpg' again.")
+    # 5. Display the result
+    if predicted_class and confidence:
+        print("\n" + "=" * 30)
+        print("          PREDICTION RESULT")
+        print("=" * 30)
+        print(f"Image:     '{IMAGE_TO_TEST}'")
+        print(f"Predicted: '{predicted_class}'")
+        print(f"Confidence: {confidence:.2%}")
+        print("=" * 30)

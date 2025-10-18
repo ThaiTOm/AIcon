@@ -101,33 +101,54 @@ custom_vit_model, custom_vit_preprocess = load_custom_vit_model(
 # ------------------------------------------------------------------------------
 # 3. CÁC HÀM PHÂN LOẠI
 # ------------------------------------------------------------------------------
+### <<< THAY ĐỔI: Hàm trả về (nhãn, xác suất) thay vì chỉ nhãn
 def classify_with_vit(image_crop_np, device='cuda:0'):
-    """Phân loại ảnh bằng model ViT pre-trained trên ImageNet."""
+    """
+    Phân loại ảnh bằng model ViT pre-trained trên ImageNet.
+    Trả về: (string, float) -> (nhãn tùy chỉnh, xác suất)
+    """
     try:
         img_pil = Image.fromarray(cv2.cvtColor(image_crop_np, cv2.COLOR_BGR2RGB))
         img_tensor = vit_preprocess(img_pil).unsqueeze(0).to(device)
         with torch.no_grad():
             output = vit_model(img_tensor)
-        prediction_index = output.argmax(dim=1)[0]
+            # Chuyển đổi logits sang xác suất bằng softmax
+            probabilities = torch.nn.functional.softmax(output, dim=1)
+            # Lấy xác suất cao nhất và chỉ số của nó
+            max_prob, prediction_index_tensor = torch.max(probabilities, 1)
+            prediction_index = prediction_index_tensor.item()
+            confidence = max_prob.item()
+
         predicted_imagenet_label = imagenet_categories[prediction_index]
-        return imagenet_to_custom_map.get(predicted_imagenet_label, "other")
+        custom_label = imagenet_to_custom_map.get(predicted_imagenet_label, "other")
+        return custom_label, confidence
     except Exception:
-        return "other"
+        return "other", 0.0
 
-
+### <<< THAY ĐỔI: Hàm trả về (nhãn, xác suất) thay vì chỉ nhãn
 def classify_bike_motorbike_with_custom_vit(image_crop_np, device='cuda:0'):
-    """Phân loại ảnh bằng model ViT tùy chỉnh để phân biệt bike/motorbike."""
+    """
+    Phân loại ảnh bằng model ViT tùy chỉnh để phân biệt bike/motorbike.
+    Trả về: (string, float) -> (nhãn tùy chỉnh, xác suất)
+    """
     try:
         img_pil = Image.fromarray(cv2.cvtColor(image_crop_np, cv2.COLOR_BGR2RGB))
         img_tensor = custom_vit_preprocess(img_pil).unsqueeze(0).to(device)
         with torch.no_grad():
             output = custom_vit_model(img_tensor)
-        prediction_index = output.argmax(dim=1)[0]
+            # Chuyển đổi logits sang xác suất bằng softmax
+            probabilities = torch.nn.functional.softmax(output, dim=1)
+            # Lấy xác suất cao nhất và chỉ số của nó
+            max_prob, prediction_index_tensor = torch.max(probabilities, 1)
+            prediction_index = prediction_index_tensor.item()
+            confidence = max_prob.item()
+
         predicted_label = CUSTOM_VIT_CLASSES[prediction_index]
         # Sử dụng map để trả về nhãn nhất quán ('bicycle' hoặc 'motorcycle')
-        return CUSTOM_VIT_LABEL_MAP.get(predicted_label, 'other')
+        final_label = CUSTOM_VIT_LABEL_MAP.get(predicted_label, 'other')
+        return final_label, confidence
     except Exception:
-        return "other"
+        return "other", 0.0
 
 
 # ==============================================================================
@@ -167,6 +188,8 @@ def analyze_videos_single_device():
     print(f"Đang tải mô hình {MODEL_NAME}...")
     yolo_model = YOLO(MODEL_NAME)
     CLASS_NAMES = yolo_model.names
+    print(CLASS_NAMES)
+
     print("Mô hình YOLO đã được tải thành công.")
 
     os.makedirs(OUTPUT_VIDEO_DIR, exist_ok=True)
@@ -187,74 +210,69 @@ def analyze_videos_single_device():
 
         cap = cv2.VideoCapture(video_path)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        tracked_object_classifications = defaultdict(list)
+        # Danh sách để lưu kết quả phát hiện của từng khung hình
         frame_by_frame_results = []
 
         # ==============================================================================
-        # GIAI ĐOẠN 1: THEO DÕI, PHÂN LOẠI VÀ THU THẬP DỮ LIỆU
+        # GIAI ĐOẠN 1: PHÁT HIỆN, PHÂN LOẠI VÀ THU THẬP DỮ LIỆU
         # ==============================================================================
-        print("Giai đoạn 1: Theo dõi và thu thập dữ liệu...")
-        for frame_idx in tqdm(range(total_frames), desc=f"Pass 1: Tracking {video_name}"):
+        print("Giai đoạn 1: Phát hiện và thu thập dữ liệu...")
+        for frame_idx in tqdm(range(total_frames), desc=f"Pass 1: Detecting {video_name}"):
             ret, frame = cap.read()
             if not ret: break
 
-            yolo_results = yolo_model.track(frame, conf=0.4, persist=True, verbose=False)[0]
+            # THAY ĐỔI: Sử dụng detect thay vì track
+            yolo_results = yolo_model.predict(frame, conf=0.1, verbose=False)[0]
 
             current_frame_objects = []
-            if yolo_results.boxes is not None and yolo_results.boxes.id is not None:
+            if yolo_results.boxes is not None:
                 for box in yolo_results.boxes:
-                    tracker_id = int(box.id[0])
+                    # Không còn tracker_id khi dùng detect
                     x1, y1, x2, y2 = map(int, box.xyxy[0])
                     yolo_label_id = int(box.cls[0])
                     yolo_label = CLASS_NAMES.get(yolo_label_id, "unknown")
+                    yolo_confidence = float(box.conf[0])
 
                     # =========================================================
                     # ========= LOGIC PHÂN LOẠI ĐÃ ĐƯỢC CẬP NHẬT =========
                     # =========================================================
                     final_label = "other"
 
-                    # Ưu tiên 1: Nếu YOLO nhận diện là motor/bike, dùng model ViT tùy chỉnh để quyết định
+                    # Ưu tiên 1: Nếu YOLO nhận diện là motor/bike, luôn dùng model ViT tùy chỉnh để quyết định
                     if yolo_label in ['motorcycle', 'bicycle']:
                         cropped_object = frame[y1:y2, x1:x2]
                         if cropped_object.size > 0:
-                            final_label = classify_bike_motorbike_with_custom_vit(cropped_object, device)
-
-                    # Ưu tiên 2: Nếu là người thì giữ nguyên
-                    elif yolo_label == 'person':
-                        final_label = 'person'
-
-                    # Mặc định: Dùng ViT ImageNet cho các lớp còn lại (ví dụ: car)
+                            final_label, _ = classify_bike_motorbike_with_custom_vit(cropped_object, device)
+                    # Mặc định: Với các lớp còn lại, so sánh xác suất của YOLO và ViT
                     else:
                         cropped_object = frame[y1:y2, x1:x2]
                         if cropped_object.size > 0:
-                            final_label = classify_with_vit(cropped_object, device)
+                            vit_label, vit_confidence = classify_with_vit(cropped_object, device)
+                            if yolo_confidence + 0.2 > vit_confidence:
+                                final_label = yolo_label  # YOLO tự tin hơn
+                            else:
+                                final_label = vit_label   # ViT tự tin hơn
                     # =========================================================
 
                     if final_label != 'other':
-                        tracked_object_classifications[tracker_id].append(final_label)
-                        current_frame_objects.append({'id': tracker_id, 'box': (x1, y1, x2, y2)})
+                        # Lưu nhãn và hộp giới hạn cho khung hình hiện tại
+                        current_frame_objects.append({'label': final_label, 'box': (x1, y1, x2, y2)})
 
             frame_by_frame_results.append(current_frame_objects)
 
         # ==============================================================================
-        # BƯỚC TRUNG GIAN: QUYẾT ĐỊNH NHÃN CUỐI CÙNG CHO MỖI ĐỐI TƯỢỢNG
+        # BƯỚC TRUNG GIAN ĐÃ BỊ LOẠI BỎ VÌ KHÔNG CÒN THEO DÕI
         # ==============================================================================
-        print("\nBước trung gian: Quyết định nhãn cuối cùng...")
-        final_object_labels = {}
-        for tracker_id, labels in tracked_object_classifications.items():
-            if labels:
-                most_common_label = Counter(labels).most_common(1)[0][0]
-                final_object_labels[tracker_id] = most_common_label
 
         # ==============================================================================
-        # GIAI ĐOẠN 2: GHI VIDEO VÀ KẾT QUẢ VỚI NHÃN CUỐI CÙNG
+        # GIAI ĐOẠN 2: GHI VIDEO VÀ TỔNG HỢP KẾT QUẢ
         # ==============================================================================
-        print("Giai đoạn 2: Ghi video và tổng hợp kết quả...")
+        print("\nGiai đoạn 2: Ghi video và tổng hợp kết quả...")
         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # Tua lại video
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         fps = cap.get(cv2.CAP_PROP_FPS)
-        output_video_path = os.path.join(OUTPUT_VIDEO_DIR, f"{video_name}_annotated_final.mp4")
+        output_video_path = os.path.join(OUTPUT_VIDEO_DIR, f"{video_name}_annotated_detection.mp4")
         out_writer = cv2.VideoWriter(output_video_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
 
         video_frame_indices = {str(i): [] for i in range(1, 9)}
@@ -266,20 +284,19 @@ def analyze_videos_single_device():
 
             annotated_frame = frame.copy()
             objects_in_this_frame = frame_by_frame_results[frame_idx]
-            frame_object_counts_final = defaultdict(int)
+            frame_object_counts = defaultdict(int)
 
             for obj in objects_in_this_frame:
-                tracker_id = obj['id']
                 box = obj['box']
-                final_label = final_object_labels.get(tracker_id)
+                label = obj['label']
 
-                if final_label:
-                    frame_object_counts_final[final_label] += 1
-                    x1, y1, x2, y2 = box
-                    cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    label_text = f"ID {tracker_id}: {final_label}"
-                    cv2.putText(annotated_frame, label_text, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0),
-                                2)
+                frame_object_counts[label] += 1
+                x1, y1, x2, y2 = box
+                cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                # THAY ĐỔI: Hiển thị nhãn, không còn ID
+                label_text = f"{label}"
+                cv2.putText(annotated_frame, label_text, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0),
+                            2)
 
             def process_match(question_id):
                 video_frame_indices[question_id].append(frame_idx)
@@ -287,7 +304,7 @@ def analyze_videos_single_device():
                     video_question_frames[question_id]["start"] = (frame_idx, annotated_frame.copy())
                 video_question_frames[question_id]["end"] = (frame_idx, annotated_frame.copy())
 
-            counts = frame_object_counts_final
+            counts = frame_object_counts
             if counts['person'] >= 1 and counts['motorcycle'] >= 1: process_match('1')
             if counts['person'] >= 1 and counts['bicycle'] >= 1: process_match('2')
             if counts['car'] >= 1: process_match('3')

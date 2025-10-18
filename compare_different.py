@@ -6,7 +6,8 @@ import cv2
 import json
 import glob
 import time
-from collections import defaultdict, Counter
+import shutil
+from collections import defaultdict
 from ultralytics import YOLO
 from tqdm import tqdm
 import torch
@@ -51,10 +52,7 @@ print("Mô hình ViT ImageNet đã được tải.")
 # 2. CẤU HÌNH MODEL ViT TÙY CHỈNH (MODEL BẠN ĐÃ HUẤN LUYỆN)
 # ------------------------------------------------------------------------------
 CUSTOM_VIT_WEIGHTS_PATH = "bike_motorbike_vit_weights.pth"
-# Các lớp mà model tùy chỉnh của bạn đã được huấn luyện, THEO ĐÚNG THỨ TỰ.
-# Dựa trên script huấn luyện của bạn, thứ tự là ['bike', 'motorbike']
 CUSTOM_VIT_CLASSES = ['bike', 'motorbike']
-# Ánh xạ từ output của model tùy chỉnh sang nhãn chuẩn hóa
 CUSTOM_VIT_LABEL_MAP = {
     'bike': 'bicycle',
     'motorbike': 'motorcycle'
@@ -68,30 +66,22 @@ def load_custom_vit_model(weights_path, num_classes):
         return None, None
 
     print(f"Đang tải mô hình ViT tùy chỉnh từ '{weights_path}'...")
-    model = models.vit_b_16(weights=None)  # Khởi tạo không có trọng số pre-trained
-
-    # Thay thế lớp phân loại cuối cùng để khớp với số lớp của bạn (là 2)
+    model = models.vit_b_16(weights=None)
     num_ftrs = model.heads.head.in_features
     model.heads.head = nn.Linear(num_ftrs, num_classes)
-
-    # Tải trọng số đã huấn luyện
-    # Dùng map_location để đảm bảo model tải được trên cả CPU và GPU
     model.load_state_dict(torch.load(weights_path, map_location=torch.device('cuda:0')))
     model.eval()
 
-    # Tạo bộ tiền xử lý ảnh (phải giống với bộ validation trong lúc train)
     preprocess = transforms.Compose([
         transforms.Resize(256),
         transforms.CenterCrop(224),
         transforms.ToTensor(),
         transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     ])
-
     print("Mô hình ViT tùy chỉnh đã được tải thành công.")
     return model, preprocess
 
 
-# Tải model ViT tùy chỉnh
 custom_vit_model, custom_vit_preprocess = load_custom_vit_model(
     CUSTOM_VIT_WEIGHTS_PATH,
     len(CUSTOM_VIT_CLASSES)
@@ -101,7 +91,6 @@ custom_vit_model, custom_vit_preprocess = load_custom_vit_model(
 # ------------------------------------------------------------------------------
 # 3. CÁC HÀM PHÂN LOẠI
 # ------------------------------------------------------------------------------
-### <<< THAY ĐỔI: Hàm trả về (nhãn, xác suất) thay vì chỉ nhãn
 def classify_with_vit(image_crop_np, device='cuda:0'):
     """
     Phân loại ảnh bằng model ViT pre-trained trên ImageNet.
@@ -112,9 +101,7 @@ def classify_with_vit(image_crop_np, device='cuda:0'):
         img_tensor = vit_preprocess(img_pil).unsqueeze(0).to(device)
         with torch.no_grad():
             output = vit_model(img_tensor)
-            # Chuyển đổi logits sang xác suất bằng softmax
             probabilities = torch.nn.functional.softmax(output, dim=1)
-            # Lấy xác suất cao nhất và chỉ số của nó
             max_prob, prediction_index_tensor = torch.max(probabilities, 1)
             prediction_index = prediction_index_tensor.item()
             confidence = max_prob.item()
@@ -125,7 +112,7 @@ def classify_with_vit(image_crop_np, device='cuda:0'):
     except Exception:
         return "other", 0.0
 
-### <<< THAY ĐỔI: Hàm trả về (nhãn, xác suất) thay vì chỉ nhãn
+
 def classify_bike_motorbike_with_custom_vit(image_crop_np, device='cuda:0'):
     """
     Phân loại ảnh bằng model ViT tùy chỉnh để phân biệt bike/motorbike.
@@ -136,15 +123,12 @@ def classify_bike_motorbike_with_custom_vit(image_crop_np, device='cuda:0'):
         img_tensor = custom_vit_preprocess(img_pil).unsqueeze(0).to(device)
         with torch.no_grad():
             output = custom_vit_model(img_tensor)
-            # Chuyển đổi logits sang xác suất bằng softmax
             probabilities = torch.nn.functional.softmax(output, dim=1)
-            # Lấy xác suất cao nhất và chỉ số của nó
             max_prob, prediction_index_tensor = torch.max(probabilities, 1)
             prediction_index = prediction_index_tensor.item()
             confidence = max_prob.item()
 
         predicted_label = CUSTOM_VIT_CLASSES[prediction_index]
-        # Sử dụng map để trả về nhãn nhất quán ('bicycle' hoặc 'motorcycle')
         final_label = CUSTOM_VIT_LABEL_MAP.get(predicted_label, 'other')
         return final_label, confidence
     except Exception:
@@ -158,13 +142,11 @@ INPUT_VIDEO_DIR = "input_videos"
 OUTPUT_VIDEO_DIR = "output_videos"
 OUTPUT_FRAMES_DIR = "output_frames"
 OUTPUT_JSON_FILE = "results.json"
-MODEL_NAME = 'yolo12x.pt'
+MODEL_NAME = 'yolo12x.pt'  # Using a standard model name
 
 # Xóa các thư mục output cũ
 for dir_path in [OUTPUT_FRAMES_DIR, OUTPUT_VIDEO_DIR]:
     if os.path.exists(dir_path):
-        import shutil
-
         shutil.rmtree(dir_path)
 
 
@@ -176,20 +158,16 @@ def analyze_videos_single_device():
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Sử dụng thiết bị: {device}")
 
-    # Chuyển các model đến đúng thiết bị
     vit_model.to(device)
     if custom_vit_model:
         custom_vit_model.to(device)
     else:
         print("CẢNH BÁO: Không thể tải model ViT tùy chỉnh. Chức năng phân loại bike/motorbike sẽ không hoạt động.")
-        return  # Dừng nếu không tải được model tùy chỉnh
+        return
 
-    # 1. Tải mô hình YOLO
     print(f"Đang tải mô hình {MODEL_NAME}...")
     yolo_model = YOLO(MODEL_NAME)
     CLASS_NAMES = yolo_model.names
-    print(CLASS_NAMES)
-
     print("Mô hình YOLO đã được tải thành công.")
 
     os.makedirs(OUTPUT_VIDEO_DIR, exist_ok=True)
@@ -210,69 +188,110 @@ def analyze_videos_single_device():
 
         cap = cv2.VideoCapture(video_path)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        # Danh sách để lưu kết quả phát hiện của từng khung hình
         frame_by_frame_results = []
 
         # ==============================================================================
-        # GIAI ĐOẠN 1: PHÁT HIỆN, PHÂN LOẠI VÀ THU THẬP DỮ LIỆU
+        # GIAI ĐOẠN 1: THEO DÕI, PHÂN LOẠI VÀ THU THẬP DỮ LIỆU
         # ==============================================================================
-        print("Giai đoạn 1: Phát hiện và thu thập dữ liệu...")
-        for frame_idx in tqdm(range(total_frames), desc=f"Pass 1: Detecting {video_name}"):
+        print("Giai đoạn 1: Theo dõi, phân loại và thu thập dữ liệu...")
+
+        # >>> THAY ĐỔI: Cấu trúc dữ liệu để lưu lịch sử của mỗi đối tượng được theo dõi
+        # Định dạng: {track_id: [{'frame': int, 'label': str, 'confidence': float}, ...]}
+        object_tracking_data = defaultdict(list)
+
+        for frame_idx in tqdm(range(total_frames), desc=f"Pass 1: Tracking {video_name}"):
             ret, frame = cap.read()
             if not ret: break
 
-            # THAY ĐỔI: Sử dụng detect thay vì track
-            yolo_results = yolo_model.predict(frame, conf=0.1, verbose=False, imgsz=2528, iou=0.3)[0]
+            # >>> THAY ĐỔI: Sử dụng .track() thay vì .predict() để lấy tracker ID
+            yolo_results = yolo_model.track(frame, conf=0.1, verbose=False, imgsz=1600, iou=0.15, persist=True, tracker="custom_track.yaml")[0]
 
             current_frame_objects = []
-            if yolo_results.boxes is not None:
-                for box in yolo_results.boxes:
-                    # Không còn tracker_id khi dùng detect
+            # Kiểm tra xem kết quả có chứa hộp và ID theo dõi không
+            if yolo_results.boxes is not None and yolo_results.boxes.id is not None:
+                tracker_ids = yolo_results.boxes.id.int().cpu().tolist()
+
+                for i, box in enumerate(yolo_results.boxes):
+                    tracker_id = tracker_ids[i]
                     x1, y1, x2, y2 = map(int, box.xyxy[0])
                     yolo_label_id = int(box.cls[0])
                     yolo_label = CLASS_NAMES.get(yolo_label_id, "unknown")
                     yolo_confidence = float(box.conf[0])
 
-                    # =========================================================
-                    # ========= LOGIC PHÂN LOẠI ĐÃ ĐƯỢC CẬP NHẬT =========
-                    # =========================================================
                     final_label = "other"
+                    final_confidence = 0.0  # >>> THÊM: Biến lưu xác suất cuối cùng
 
-                    # Ưu tiên 1: Nếu YOLO nhận diện là motor/bike, luôn dùng model ViT tùy chỉnh để quyết định
                     if yolo_label in ['motorcycle', 'bicycle']:
                         cropped_object = frame[y1:y2, x1:x2]
                         if cropped_object.size > 0:
-                            final_label, _ = classify_bike_motorbike_with_custom_vit(cropped_object, device)
-                    # Mặc định: Với các lớp còn lại, so sánh xác suất của YOLO và ViT
+                            final_label, final_confidence = classify_bike_motorbike_with_custom_vit(cropped_object,
+                                                                                                    device)
                     else:
                         cropped_object = frame[y1:y2, x1:x2]
                         if cropped_object.size > 0:
                             vit_label, vit_confidence = classify_with_vit(cropped_object, device)
-                            if yolo_confidence + 0.2 > vit_confidence:
-                                final_label = yolo_label  # YOLO tự tin hơn
+                            if yolo_confidence + 0.05 > vit_confidence:
+                                final_label = yolo_label
+                                final_confidence = yolo_confidence  # >>> LƯU XÁC SUẤT
                             else:
-                                final_label = vit_label   # ViT tự tin hơn
-                    # =========================================================
+                                final_label = vit_label
+                                final_confidence = vit_confidence  # >>> LƯU XÁC SUẤT
 
                     if final_label != 'other':
-                        # Lưu nhãn và hộp giới hạn cho khung hình hiện tại
                         current_frame_objects.append({'label': final_label, 'box': (x1, y1, x2, y2)})
+                        # >>> THAY ĐỔI: Lưu kết quả vào cấu trúc dữ liệu theo dõi
+                        object_tracking_data[tracker_id].append({
+                            'frame': frame_idx,
+                            'label': final_label,
+                            'confidence': final_confidence
+                        })
 
             frame_by_frame_results.append(current_frame_objects)
 
         # ==============================================================================
-        # BƯỚC TRUNG GIAN ĐÃ BỊ LOẠI BỎ VÌ KHÔNG CÒN THEO DÕI
+        # >>> GIAI ĐOẠN 2 MỚI: PHÂN TÍCH DỮ LIỆU ĐỂ TÌM FRAME TỐT NHẤT
         # ==============================================================================
+        print("\nGiai đoạn 2: Phân tích dữ liệu theo dõi...")
+        best_frames_per_object = {}
+
+        for track_id, data_points in object_tracking_data.items():
+            if not data_points: continue
+
+            # Kiểm tra xem lớp của đối tượng có nhất quán trong suốt quá trình theo dõi không
+            first_label = data_points[0]['label']
+            is_class_consistent = all(d['label'] == first_label for d in data_points)
+
+            if is_class_consistent:
+                # Nếu lớp nhất quán, tìm điểm dữ liệu (frame) có xác suất cao nhất
+                best_point = max(data_points, key=lambda x: x['confidence'])
+                best_frames_per_object[track_id] = {
+                    'label': first_label,
+                    'best_frame': best_point['frame'],
+                    'highest_prob': best_point['confidence']
+                }
+
+        # In kết quả phân tích ra màn hình
+        print("\n--- KẾT QUẢ PHÂN TÍCH FRAME CÓ XÁC SUẤT CAO NHẤT ---")
+        if not best_frames_per_object:
+            print("Không tìm thấy đối tượng nào có lớp nhất quán để phân tích.")
+        else:
+            for track_id, info in best_frames_per_object.items():
+                print(
+                    f"  - Đối tượng ID: {track_id}, Lớp: '{info['label']}'"
+                    f"  -> Frame tốt nhất: {info['best_frame']}"
+                    f" (Xác suất: {info['highest_prob']:.4f})"
+                )
+        print("-----------------------------------------------------------\n")
 
         # ==============================================================================
-        # GIAI ĐOẠN 2: GHI VIDEO VÀ TỔNG HỢP KẾT QUẢ
+        # GIAI ĐOẠN 3: GHI VIDEO VÀ TỔNG HỢP KẾT QUẢ
         # ==============================================================================
-        print("\nGiai đoạn 2: Ghi video và tổng hợp kết quả...")
-        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # Tua lại video
+        print("Giai đoạn 3: Ghi video và tổng hợp kết quả...")
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         fps = cap.get(cv2.CAP_PROP_FPS)
-        output_video_path = os.path.join(OUTPUT_VIDEO_DIR, f"{video_name}_annotated_detection.mp4")
+        output_video_path = os.path.join(OUTPUT_VIDEO_DIR, f"{video_name}_annotated.mp4")
         out_writer = cv2.VideoWriter(output_video_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
 
         video_frame_indices = {str(i): [] for i in range(1, 9)}
@@ -289,14 +308,11 @@ def analyze_videos_single_device():
             for obj in objects_in_this_frame:
                 box = obj['box']
                 label = obj['label']
-
                 frame_object_counts[label] += 1
                 x1, y1, x2, y2 = box
                 cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                # THAY ĐỔI: Hiển thị nhãn, không còn ID
                 label_text = f"{label}"
-                cv2.putText(annotated_frame, label_text, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0),
-                            2)
+                cv2.putText(annotated_frame, label_text, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
 
             def process_match(question_id):
                 video_frame_indices[question_id].append(frame_idx)

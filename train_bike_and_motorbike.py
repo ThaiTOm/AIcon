@@ -1,4 +1,4 @@
-# train_vit.py
+# train_vit_head_only_ddp.py
 
 # ==============================================================================
 # PHẦN IMPORT THƯ VIỆN
@@ -14,139 +14,93 @@ import os
 import shutil
 import random
 
+# ### THAY ĐỔI CHO DDP ###
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
+# ### KẾT THÚC THAY ĐỔI ###
+
+
 # ==============================================================================
 # PHẦN CẤU HÌNH HUẤN LUYỆN
 # ==============================================================================
-# Thư mục chứa các thư mục lớp gốc (ví dụ: 'datasets/bike', 'datasets/motorbike')
 SOURCE_DATA_DIR = "datasets"
-# Thư mục đích để chứa bộ dữ liệu đã được chia train/val
 PREPARED_DATA_DIR = os.path.join(SOURCE_DATA_DIR, "prepared_data")
 
+# Tên tệp để lưu trọng số đã huấn luyện (thay đổi để không ghi đè)
+WEIGHTS_SAVE_PATH = "bike_motorbike_vit_weights.pth"
+
+# Hyperparameters
+LEARNING_RATE = 0.001
+BATCH_SIZE = 64  # Đây là batch size cho MỖI GPU
+NUM_EPOCHS = 15
+SPLIT_RATIO = 0.9
+
+# ==============================================================================
+# CÁC HÀM TIỆN ÍCH DDP VÀ DỮ LIỆU (KHÔNG THAY ĐỔI)
+# ==============================================================================
+def setup_ddp():
+    dist.init_process_group(backend="nccl")
+    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+
+def cleanup_ddp():
+    dist.destroy_process_group()
 
 def clean_image_dataset(root_dir):
-    """
-    Duyệt qua tất cả các tệp trong thư mục và các thư mục con,
-    xóa các tệp không thể mở và chuyển đổi sang RGB.
-    """
     if not os.path.isdir(root_dir):
         print(f"Lỗi: Thư mục '{root_dir}' không tồn tại.")
         return
-
     print(f"Bắt đầu quá trình quét và dọn dẹp thư mục: {root_dir}")
-
     deleted_files_count = 0
-
-    # Tạo một danh sách các file để duyệt qua, giúp tqdm hoạt động tốt hơn
     all_files = []
     for subdir, dirs, files in os.walk(root_dir):
         for filename in files:
             all_files.append(os.path.join(subdir, filename))
-
     print(f"Tìm thấy tổng cộng {len(all_files)} tệp để kiểm tra.")
-
     for file_path in tqdm(all_files, desc="Đang kiểm tra ảnh"):
-        # Kiểm tra phần mở rộng tệp để chỉ xử lý các định dạng ảnh phổ biến
         if not file_path.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.tiff')):
             continue
-
         try:
-            # Cố gắng mở ảnh
             with Image.open(file_path) as img:
-                # ### <<< THAY ĐỔI QUAN TRỌNG ###
-                # Thay vì chỉ verify(), chúng ta thực hiện convert('RGB').
-                # Đây là bài kiểm tra mạnh hơn nhiều, nó buộc Pillow phải đọc
-                # toàn bộ dữ liệu ảnh, giống hệt như DataLoader làm.
                 img.convert('RGB')
-
         except (IOError, OSError, UnidentifiedImageError) as e:
-            # Nếu có bất kỳ lỗi nào xảy ra khi mở hoặc chuyển đổi ảnh
-            print(f"\nPhát hiện tệp ảnh bị lỗi hoặc không thể xử lý: {file_path}")
-            print(f"Lỗi: {e}")
-
+            print(f"\nPhát hiện tệp ảnh bị lỗi: {file_path} | Lỗi: {e}")
             try:
-                # Cố gắng xóa tệp bị lỗi
                 os.remove(file_path)
                 print(f"Đã xóa thành công tệp: {file_path}")
                 deleted_files_count += 1
             except OSError as remove_error:
                 print(f"Lỗi khi xóa tệp: {remove_error}")
+    print(f"\nQUÁ TRÌNH DỌN DẸP CHO '{root_dir}' HOÀN TẤT! Đã xóa {deleted_files_count} tệp lỗi.")
 
-    print("\n==============================================")
-    print(f"QUÁ TRÌNH DỌN DẸP CHO '{root_dir}' HOÀN TẤT!")
-    if deleted_files_count > 0:
-        print(f"Tổng số tệp ảnh bị lỗi và đã được xóa: {deleted_files_count}")
-    else:
-        print("Không tìm thấy tệp ảnh nào bị lỗi trong thư mục này.")
-    print("==============================================")
-
-# Tên tệp để lưu trọng số đã huấn luyện
-WEIGHTS_SAVE_PATH = "bike_motorbike_vit_weights.pth"
-
-# Hyperparameters
-LEARNING_RATE = 0.001
-BATCH_SIZE = 32
-NUM_EPOCHS = 15
-SPLIT_RATIO = 0.8  # 80% cho huấn luyện, 20% cho xác thực
-
-# Thiết bị (sử dụng GPU nếu có)
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"Sử dụng thiết bị: {DEVICE}")
-
-
-# ==============================================================================
-# PHẦN CHUẨN BỊ VÀ CHIA TÁCH DỮ LIỆU
-# ==============================================================================
 def split_data_from_source(source_dir, prepared_dir, split_ratio):
-    """
-    Tự động chia dữ liệu từ các thư mục lớp gốc thành cấu trúc train/val.
-    """
     classes = ['bike', 'motorbike']
-
-    # Kiểm tra xem dữ liệu đã được chuẩn bị chưa để tránh làm lại
     if os.path.exists(os.path.join(prepared_dir, 'train')) and os.path.exists(os.path.join(prepared_dir, 'val')):
         print(f"Thư mục '{prepared_dir}' đã có cấu trúc train/val. Bỏ qua bước chia tách.")
         return
-
     print(f"Đang chuẩn bị và chia tách dữ liệu vào '{prepared_dir}'...")
-
-    # Xóa thư mục cũ nếu có để đảm bảo sự sạch sẽ
     if os.path.exists(prepared_dir):
         shutil.rmtree(prepared_dir)
-
-    # Tạo các thư mục train/val cần thiết
     for split in ['train', 'val']:
         for cls in classes:
             os.makedirs(os.path.join(prepared_dir, split, cls), exist_ok=True)
-
     for cls in classes:
         source_class_dir = os.path.join(source_dir, cls)
-
-        # Kiểm tra xem thư mục lớp nguồn có tồn tại không
         if not os.path.isdir(source_class_dir):
-            print(f"Cảnh báo: Không tìm thấy thư mục nguồn '{source_class_dir}'. Bỏ qua lớp này.")
+            print(f"Cảnh báo: Không tìm thấy '{source_class_dir}'. Bỏ qua.")
             continue
-
         all_files = [f for f in os.listdir(source_class_dir) if os.path.isfile(os.path.join(source_class_dir, f))]
         random.shuffle(all_files)
-
         split_point = int(len(all_files) * split_ratio)
         train_files = all_files[:split_point]
         val_files = all_files[split_point:]
-
-        # Sao chép tệp vào thư mục train
         for f in tqdm(train_files, desc=f"Sao chép {cls} vào train"):
             shutil.copy(os.path.join(source_class_dir, f), os.path.join(prepared_dir, 'train', cls, f))
-
-        # Sao chép tệp vào thư mục val
         for f in tqdm(val_files, desc=f"Sao chép {cls} vào val"):
             shutil.copy(os.path.join(source_class_dir, f), os.path.join(prepared_dir, 'val', cls, f))
-
-
     print("Chia tách dữ liệu hoàn tất.")
 
-
-def create_dataloaders(prepared_dataset_dir):
-    """Tạo dataloaders từ thư mục dữ liệu đã được chuẩn bị."""
+def create_dataloaders(prepared_dataset_dir, rank):
     data_transforms = {
         'train': transforms.Compose([
             transforms.RandomResizedCrop(224),
@@ -162,52 +116,54 @@ def create_dataloaders(prepared_dataset_dir):
             transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
         ]),
     }
-    clean_image_dataset(os.path.join(prepared_dataset_dir, 'train', 'bike'))
-    clean_image_dataset(os.path.join(prepared_dataset_dir, 'train', 'motorbike'))
-    clean_image_dataset(os.path.join(prepared_dataset_dir, 'val', 'bike'))
-    clean_image_dataset(os.path.join(prepared_dataset_dir, 'val', 'motorbike'))
-
-
+    if rank == 0:
+        # clean_image_dataset(os.path.join(prepared_dataset_dir, 'train', 'bike'))
+        # clean_image_dataset(os.path.join(prepared_dataset_dir, 'train', 'motorbike'))
+        # clean_image_dataset(os.path.join(prepared_dataset_dir, 'val', 'bike'))
+        # clean_image_dataset(os.path.join(prepared_dataset_dir, 'val', 'motorbike'))
+        pass
+    dist.barrier()
     image_datasets = {x: datasets.ImageFolder(os.path.join(prepared_dataset_dir, x), data_transforms[x])
                       for x in ['train', 'val']}
-
-    dataloaders = {x: DataLoader(image_datasets[x], batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
+    samplers = {
+        'train': DistributedSampler(image_datasets['train'], shuffle=True),
+        'val': DistributedSampler(image_datasets['val'], shuffle=False)
+    }
+    dataloaders = {x: DataLoader(image_datasets[x], batch_size=BATCH_SIZE, shuffle=False, num_workers=4,
+                                 pin_memory=True, sampler=samplers[x])
                    for x in ['train', 'val']}
-
     class_names = image_datasets['train'].classes
-
-    print("Các lớp được tìm thấy:", class_names)
+    if rank == 0:
+        print("Các lớp được tìm thấy:", class_names)
     if not (set(class_names) == {'bike', 'motorbike'}):
         raise ValueError("Các lớp trong bộ dữ liệu phải là 'bike' và 'motorbike'.")
-
-    return dataloaders, class_names
+    return dataloaders, class_names, samplers['train']
 
 
 # ==============================================================================
-# PHẦN HUẤN LUYỆN (Không thay đổi)
+# PHẦN HUẤN LUYỆN (KHÔNG THAY ĐỔI)
 # ==============================================================================
-def train_model(model, criterion, optimizer, dataloaders, num_epochs=10):
-    """Hàm chính để huấn luyện mô hình."""
+def train_model(model, criterion, optimizer, dataloaders, train_sampler, num_epochs, local_rank, rank):
     best_acc = 0.0
-
     for epoch in range(num_epochs):
-        print(f'Epoch {epoch + 1}/{num_epochs}')
-        print('-' * 10)
-
+        train_sampler.set_epoch(epoch)
+        if rank == 0:
+            print(f'Epoch {epoch + 1}/{num_epochs}')
+            print('-' * 10)
         for phase in ['train', 'val']:
             if phase == 'train':
                 model.train()
             else:
                 model.eval()
-
             running_loss = 0.0
             running_corrects = 0
-
-            for inputs, labels in tqdm(dataloaders[phase], desc=f"{phase.capitalize()} Phase"):
-                inputs = inputs.to(DEVICE)
-                labels = labels.to(DEVICE)
+            iterable = dataloaders[phase]
+            if rank == 0:
+                iterable = tqdm(iterable, desc=f"{phase.capitalize()} Phase")
+            for inputs, labels in iterable:
+                inputs = inputs.to(local_rank)
+                labels = labels.to(local_rank)
                 optimizer.zero_grad()
-
                 with torch.set_grad_enabled(phase == 'train'):
                     outputs = model(inputs)
                     _, preds = torch.max(outputs, 1)
@@ -215,20 +171,20 @@ def train_model(model, criterion, optimizer, dataloaders, num_epochs=10):
                     if phase == 'train':
                         loss.backward()
                         optimizer.step()
-
                 running_loss += loss.item() * inputs.size(0)
                 running_corrects += torch.sum(preds == labels.data)
-
-            epoch_loss = running_loss / len(dataloaders[phase].dataset)
-            epoch_acc = running_corrects.double() / len(dataloaders[phase].dataset)
-
-            print(f'{phase.capitalize()} Loss: {epoch_loss:.4f} Acc: {epoch_acc:.4f}\n')
-
-            if phase == 'val' and epoch_acc > best_acc:
-                best_acc = epoch_acc
-                torch.save(model.state_dict(), WEIGHTS_SAVE_PATH)
-                print(f"Độ chính xác xác thực tốt nhất mới: {best_acc:.4f}. Đã lưu trọng số vào '{WEIGHTS_SAVE_PATH}'!")
-
+            total_loss = torch.tensor(running_loss).to(local_rank)
+            total_corrects = torch.tensor(running_corrects).to(local_rank)
+            dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
+            dist.all_reduce(total_corrects, op=dist.ReduceOp.SUM)
+            epoch_loss = total_loss / len(dataloaders[phase].dataset)
+            epoch_acc = total_corrects.double() / len(dataloaders[phase].dataset)
+            if rank == 0:
+                print(f'{phase.capitalize()} Loss: {epoch_loss:.4f} Acc: {epoch_acc:.4f}\n')
+                if phase == 'val' and epoch_acc > best_acc:
+                    best_acc = epoch_acc
+                    torch.save(model.module.state_dict(), WEIGHTS_SAVE_PATH)
+                    print(f"Độ chính xác tốt nhất mới: {best_acc:.4f}. Đã lưu trọng số vào '{WEIGHTS_SAVE_PATH}'!")
     return model
 
 
@@ -236,31 +192,61 @@ def train_model(model, criterion, optimizer, dataloaders, num_epochs=10):
 # HÀM MAIN
 # ==============================================================================
 if __name__ == '__main__':
-    # 1. Tự động chia tách dữ liệu từ thư mục nguồn
-    split_data_from_source(SOURCE_DATA_DIR, PREPARED_DATA_DIR, SPLIT_RATIO)
+    setup_ddp()
+    world_size = int(os.environ["WORLD_SIZE"])
+    rank = int(os.environ["RANK"])
+    local_rank = int(os.environ["LOCAL_RANK"])
+    print(f"Bắt đầu process rank {rank} trên GPU {local_rank}.")
 
-    # 2. Tạo Dataloaders từ dữ liệu đã được chuẩn bị
-    dataloaders, class_names = create_dataloaders(PREPARED_DATA_DIR)
+    if rank == 0:
+        split_data_from_source(SOURCE_DATA_DIR, PREPARED_DATA_DIR, SPLIT_RATIO)
+    dist.barrier()
 
-    # 3. Tải mô hình ViT-B-16 đã được huấn luyện trước
+    dataloaders, class_names, train_sampler = create_dataloaders(PREPARED_DATA_DIR, rank)
+
+    # 3. Tải mô hình ViT-B-16
     model = models.vit_b_16(weights=models.ViT_B_16_Weights.IMAGENET1K_V1)
 
-    # 4. Thay thế lớp phân loại cuối cùng
+    # ### <<< THAY ĐỔI QUAN TRỌNG: ĐÓNG BĂNG CÁC LỚP GỐC ###
+    if rank == 0:
+        print("Đóng băng tất cả các tham số của mô hình gốc...")
+    for param in model.parameters():
+        param.requires_grad = False
+    # ### KẾT THÚC THAY ĐỔI ###
+
+    # 4. Thay thế lớp phân loại cuối cùng.
+    # Các tham số của lớp mới này sẽ có `requires_grad=True` theo mặc định.
     num_ftrs = model.heads.head.in_features
     model.heads.head = nn.Linear(num_ftrs, len(class_names))
-
-    model.load_state_dict(torch.load("bike_motorbike_vit_weights.pth", map_location=torch.device('cuda:0')))
-
-
-    model = model.to(DEVICE)
-    print("Mô hình đã được sửa đổi cho 2 lớp.")
+    if rank == 0:
+        print("Đã thay thế lớp head. Chỉ có các tham số của lớp head mới sẽ được huấn luyện.")
 
     # 5. Định nghĩa hàm mất mát và bộ tối ưu hóa
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
-    # 6. Bắt đầu huấn luyện
-    print("\nBắt đầu quá trình huấn luyện...")
-    train_model(model, criterion, optimizer, dataloaders, num_epochs=NUM_EPOCHS)
+    # ### <<< THAY ĐỔI QUAN TRỌNG: CHỈ TỐI ƯU HÓA CÁC THAM SỐ CỦA HEAD ###
+    # Thay vì `model.parameters()`, chúng ta chỉ truyền các tham số của lớp cuối cùng.
+    # Điều này hiệu quả hơn và đảm bảo chỉ có head được cập nhật.
+    optimizer = optim.Adam(model.heads.head.parameters(), lr=LEARNING_RATE)
+    if rank == 0:
+        print("Optimizer được cấu hình để chỉ cập nhật các tham số của lớp head.")
+    # ### KẾT THÚC THAY ĐỔI ###
 
-    print("\nHuấn luyện hoàn tất.")
+    # Chuyển mô hình đến GPU tương ứng
+    model = model.to(local_rank)
+
+    # Bọc mô hình với DDP
+    model = DDP(model, device_ids=[local_rank])
+    if rank == 0:
+        print("Mô hình đã được bọc bằng DDP.")
+
+    # Bắt đầu huấn luyện
+    if rank == 0:
+        print("\nBắt đầu quá trình huấn luyện (chỉ head)...")
+    train_model(model, criterion, optimizer, dataloaders, train_sampler,
+                num_epochs=NUM_EPOCHS, local_rank=local_rank, rank=rank)
+
+    if rank == 0:
+        print("\nHuấn luyện hoàn tất.")
+
+    cleanup_ddp()

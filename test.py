@@ -119,7 +119,6 @@ if __name__ == '__main__':
         print(f"Error: Weights file not found at '{WEIGHTS_PATH}'")
         print("Please make sure you have run the training script and the file is in the correct location.")
         sys.exit(1)
-
     # 2. Load the trained model
     model = load_trained_model(WEIGHTS_PATH, len(CLASS_NAMES))
 

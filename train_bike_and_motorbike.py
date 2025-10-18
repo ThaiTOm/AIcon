@@ -24,7 +24,7 @@ from torch.utils.data.distributed import DistributedSampler
 # ==============================================================================
 # PHẦN CẤU HÌNH HUẤN LUYỆN
 # ==============================================================================
-SOURCE_DATA_DIR = "datasets"
+SOURCE_DATA_DIR = "datasets/Street-View-3-Classification-Filtered"
 PREPARED_DATA_DIR = os.path.join(SOURCE_DATA_DIR, "prepared_data")
 
 # Tên tệp để lưu trọng số đã huấn luyện (thay đổi để không ghi đè)
@@ -75,7 +75,7 @@ def clean_image_dataset(root_dir):
 
 def split_data_from_source(source_dir, prepared_dir, split_ratio):
     classes = ['bike', 'motorbike']
-    if os.path.exists(os.path.join(prepared_dir, 'train')) and os.path.exists(os.path.join(prepared_dir, 'val')):
+    if os.path.exists(os.path.join(prepared_dir, 'train')) and os.path.exists(os.path.join(prepared_dir, 'valid')):
         print(f"Thư mục '{prepared_dir}' đã có cấu trúc train/val. Bỏ qua bước chia tách.")
         return
     print(f"Đang chuẩn bị và chia tách dữ liệu vào '{prepared_dir}'...")
@@ -103,39 +103,53 @@ def split_data_from_source(source_dir, prepared_dir, split_ratio):
 def create_dataloaders(prepared_dataset_dir, rank):
     data_transforms = {
         'train': transforms.Compose([
-            transforms.RandomResizedCrop(224),
-            transforms.RandomHorizontalFlip(),
-            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
-            transforms.ToTensor(),
-            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-        ]),
-        'val': transforms.Compose([
+        # --- 1. Các phép biến đổi áp dụng trên ảnh PIL ---
+        transforms.RandomResizedCrop(224, scale=(0.6, 1.0)),
+        transforms.RandomRotation(30),
+        transforms.RandomPerspective(distortion_scale=0.4, p=0.5),
+        transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1),
+        transforms.RandomGrayscale(p=0.1),
+        transforms.GaussianBlur(kernel_size=(5, 9), sigma=(0.1, 5.)),
+        transforms.RandomHorizontalFlip(),
+
+        # --- 2. Chuyển đổi ảnh PIL sang PyTorch Tensor ---
+        # BƯỚC QUAN TRỌNG: Phải đặt ToTensor() ở đây
+        transforms.ToTensor(),
+
+        # --- 3. Các phép biến đổi áp dụng trên Tensor ---
+        # RandomErasing và Normalize giờ sẽ nhận đầu vào là Tensor và hoạt động chính xác
+        transforms.RandomErasing(p=0.5, scale=(0.02, 0.33), ratio=(0.3, 3.3), value=0, inplace=False),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ]),
+
+        # Phần 'val' không có RandomErasing nên không bị lỗi, nhưng vẫn nên giữ cấu trúc chuẩn
+        'valid': transforms.Compose([
             transforms.Resize(256),
             transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+            transforms.ToTensor(), # Chuyển sang Tensor
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]) # Chuẩn hóa Tensor
         ]),
     }
     if rank == 0:
-        # clean_image_dataset(os.path.join(prepared_dataset_dir, 'train', 'bike'))
-        # clean_image_dataset(os.path.join(prepared_dataset_dir, 'train', 'motorbike'))
-        # clean_image_dataset(os.path.join(prepared_dataset_dir, 'val', 'bike'))
-        # clean_image_dataset(os.path.join(prepared_dataset_dir, 'val', 'motorbike'))
+        clean_image_dataset(os.path.join(prepared_dataset_dir, 'train', 'bike'))
+        clean_image_dataset(os.path.join(prepared_dataset_dir, 'train', 'motorbike'))
+        clean_image_dataset(os.path.join(prepared_dataset_dir, 'valid', 'bike'))
+        clean_image_dataset(os.path.join(prepared_dataset_dir, 'valid', 'motorbike'))
         pass
     dist.barrier()
     image_datasets = {x: datasets.ImageFolder(os.path.join(prepared_dataset_dir, x), data_transforms[x])
-                      for x in ['train', 'val']}
+                      for x in ['train', 'valid']}
     samplers = {
         'train': DistributedSampler(image_datasets['train'], shuffle=True),
-        'val': DistributedSampler(image_datasets['val'], shuffle=False)
+        'valid': DistributedSampler(image_datasets['valid'], shuffle=False)
     }
     dataloaders = {x: DataLoader(image_datasets[x], batch_size=BATCH_SIZE, shuffle=False, num_workers=4,
                                  pin_memory=True, sampler=samplers[x])
-                   for x in ['train', 'val']}
+                   for x in ['train', 'valid']}
     class_names = image_datasets['train'].classes
     if rank == 0:
         print("Các lớp được tìm thấy:", class_names)
-    if not (set(class_names) == {'bike', 'motorbike'}):
+    if not (set(class_names) == {'bicycle', 'motorbike'}):
         raise ValueError("Các lớp trong bộ dữ liệu phải là 'bike' và 'motorbike'.")
     return dataloaders, class_names, samplers['train']
 
@@ -150,7 +164,7 @@ def train_model(model, criterion, optimizer, dataloaders, train_sampler, num_epo
         if rank == 0:
             print(f'Epoch {epoch + 1}/{num_epochs}')
             print('-' * 10)
-        for phase in ['train', 'val']:
+        for phase in ['train', 'valid']:
             if phase == 'train':
                 model.train()
             else:
@@ -181,7 +195,7 @@ def train_model(model, criterion, optimizer, dataloaders, train_sampler, num_epo
             epoch_acc = total_corrects.double() / len(dataloaders[phase].dataset)
             if rank == 0:
                 print(f'{phase.capitalize()} Loss: {epoch_loss:.4f} Acc: {epoch_acc:.4f}\n')
-                if phase == 'val' and epoch_acc > best_acc:
+                if phase == 'valid' and epoch_acc > best_acc:
                     best_acc = epoch_acc
                     torch.save(model.module.state_dict(), WEIGHTS_SAVE_PATH)
                     print(f"Độ chính xác tốt nhất mới: {best_acc:.4f}. Đã lưu trọng số vào '{WEIGHTS_SAVE_PATH}'!")
@@ -198,11 +212,11 @@ if __name__ == '__main__':
     local_rank = int(os.environ["LOCAL_RANK"])
     print(f"Bắt đầu process rank {rank} trên GPU {local_rank}.")
 
-    if rank == 0:
-        split_data_from_source(SOURCE_DATA_DIR, PREPARED_DATA_DIR, SPLIT_RATIO)
+    # if rank == 0:
+        # split_data_from_source(SOURCE_DATA_DIR, PREPARED_DATA_DIR, SPLIT_RATIO)
     dist.barrier()
 
-    dataloaders, class_names, train_sampler = create_dataloaders(PREPARED_DATA_DIR, rank)
+    dataloaders, class_names, train_sampler = create_dataloaders(SOURCE_DATA_DIR, rank)
 
     # 3. Tải mô hình ViT-B-16
     model = models.vit_b_16(weights=models.ViT_B_16_Weights.IMAGENET1K_V1)
@@ -218,6 +232,7 @@ if __name__ == '__main__':
     # Các tham số của lớp mới này sẽ có `requires_grad=True` theo mặc định.
     num_ftrs = model.heads.head.in_features
     model.heads.head = nn.Linear(num_ftrs, len(class_names))
+    model.load_state_dict(torch.load(WEIGHTS_SAVE_PATH))
     if rank == 0:
         print("Đã thay thế lớp head. Chỉ có các tham số của lớp head mới sẽ được huấn luyện.")
 

@@ -222,7 +222,7 @@ def analyze_videos_single_device():
             if not ret: break
 
             # THAY ĐỔI: Sử dụng detect thay vì track
-            yolo_results = yolo_model.predict(frame, conf=0.1, verbose=False)[0]
+            yolo_results = yolo_model.predict(frame, conf=0.1, verbose=False, imgsz=2528, iou=0.3)[0]
 
             current_frame_objects = []
             if yolo_results.boxes is not None:
